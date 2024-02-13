@@ -1,0 +1,61 @@
+---
+title: "DataProcessing"
+author: "Katy Miles"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load in libraries
+library(tidyverse)
+library(readxl)
+```
+
+Visits 2,3,4 represent baseline, post1 and post2 for the initial treatment phase.  Visits 5,6,7 represent baseline, post1 and post2 for the second treatment phase.
+
+Analysis will be run for the following response variables: OGA.BWD_AL, SOS, CSOM.ACT(MEAN), CSOM.BEHAV(MEAN), CBPI.PSS	, CBPI.PIS, CBPI.QOL, Actical (Sed, Light, Vig, Total Daily Activity Count). 
+Summary statistics including mean, median, standard deviation, minimum, Q1, Q3 and maximum of each response variable by treatment and time point will be calculated.  Summary graphs such as boxplots will also be created for response variables by treatment and visit.
+
+## Data Processing
+```{r}
+# read in data
+raw_data = read_excel("Study Stats Platinum_Final_2-2-24.xlsx")
+
+# Code visits in terms of basline, post1, post2
+clean_data = raw_data %>%
+  mutate(Phase = ifelse(Visit == 2 | Visit == 5, "baseline",
+                        ifelse(Visit == 3 | Visit == 6, "post1",
+                        ifelse(Visit == 4 | Visit == 7, "post2", "intro")))) %>%
+  filter(Visit != 1) %>%   # Drop visit 1 as not used in analysis
+  select(-c(`Enroll #`, `TX`, `Affected Limb (AL)` , `Visit`)) %>%
+  remove_missing()
+```
+
+## Summary Statistics
+```{r}
+summary  = clean_data %>%
+      group_by(Phase, Group) %>%
+        summarise(across(
+          .cols = where(is.numeric), 
+          .fns = list(Mean = mean, SD = sd, Min = min, Max = max,
+                      Median = median),
+          .names = "{col}_{fn}"))
+```
+
+## Summary plots
+```{r}
+response_variables = colnames(clean_data)[2:22]
+
+create_boxplots = function(input) {
+  p = ggplot(clean_data, aes(x = Phase, color= Group)) + 
+  geom_boxplot(aes_string(y = input)) + 
+  theme_minimal()
+  return(p)
+}
+
+boxplot_list = lapply(response_variables, create_boxplots)
+```
