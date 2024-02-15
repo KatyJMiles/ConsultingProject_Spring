@@ -13,6 +13,9 @@ knitr::opts_chunk$set(echo = TRUE)
 # Load in libraries
 library(tidyverse)
 library(readxl)
+library(lme4)
+library(emmeans)
+library(openxlsx)
 ```
 
 Visits 2,3,4 represent baseline, post1 and post2 for the initial treatment phase.  Visits 5,6,7 represent baseline, post1 and post2 for the second treatment phase.
@@ -31,31 +34,99 @@ clean_data = raw_data %>%
                         ifelse(Visit == 3 | Visit == 6, "post1",
                         ifelse(Visit == 4 | Visit == 7, "post2", "intro")))) %>%
   filter(Visit != 1) %>%   # Drop visit 1 as not used in analysis
-  select(-c(`Enroll #`, `TX`, `Affected Limb (AL)` , `Visit`)) %>%
-  remove_missing()
+  select(-c(`TX`, `Affected Limb (AL)` , `Visit`)) %>%
+  rename(Patient = `Enroll #`) %>%
+  remove_missing() %>%
+  pivot_longer(!c(Group, Patient, Phase), names_to = "Response", values_to = "Value")
 ```
 
 ## Summary Statistics
 ```{r}
 summary  = clean_data %>%
-      group_by(Phase, Group) %>%
-        summarise(across(
-          .cols = where(is.numeric), 
-          .fns = list(Mean = mean, SD = sd, Min = min, Max = max,
-                      Median = median),
-          .names = "{col}_{fn}"))
+      group_by(Phase, Group, Response) %>%
+        summarise(Min=min(Value), 
+                  Q1=quantile(Value, probs = 0.25),
+                  Median=median(Value), 
+                  Mean = mean(Value), 
+                  Q3=quantile(Value, probs = 0.75),
+                  Max=max(Value), 
+                  SD = sd(Value)) %>%
+  arrange(Response, Group)
+
+write.csv(summary, "summary_stats.csv", row.names = FALSE)
 ```
 
 ## Summary plots
 ```{r}
-response_variables = colnames(clean_data)[2:22]
+response_variables = unique(clean_data$Response)
 
 create_boxplots = function(input) {
-  p = ggplot(clean_data, aes(x = Phase, color= Group)) + 
-  geom_boxplot(aes_string(y = input)) + 
-  theme_minimal()
+  data = clean_data %>%
+    filter(Response == input)
+  
+  p = ggplot(data, aes(x = Phase, y = Value, color= Group)) + 
+    geom_boxplot() + 
+    ylab(input) + 
+    theme_minimal()
   return(p)
 }
 
 boxplot_list = lapply(response_variables, create_boxplots)
+names(boxplot_list) = response_variables
 ```
+
+## Analysis
+
+A mixed model will be fit separately for each response variable.  Treatment (A or B), time (baseline, post1, post2), and an interaction between treatment and time will be included as fixed effects. Patient will be included as a random effect to account for variability between different individual dogs. Benjamini-Hochberge adjusted p-values will be provided to account for multiple response variables.  For those variables that show evidence of a treatment or treatment*time interaction, further pairwise comparisons will be presented. Residual diagnostic plots will be used to check model assumptions. 
+
+```{r}
+fit_model = function(input) {
+  data = clean_data %>%
+       filter(Response == input)
+  fit = lmer(Value ~ Phase*Group + (1|Patient), data = data)
+}
+
+model_list = map(response_variables, fit_model)
+names(model_list) = response_variables
+
+model_summary = map(model_list, anova)
+names(model_summary) = response_variables
+
+
+plist = as.data.frame(t(unlist(model_summary))) %>%
+  select(matches(".Pr"))
+
+anova_df =  as.data.frame(do.call(rbind, model_summary))  %>%
+  rownames_to_column() %>%
+  rename(Response = rowname) %>%
+  filter(str_detect(Response, "Phase"))
+
+write.csv(anova_df, "analysis_results.csv", row.names = FALSE)
+
+# Get pairwise comparisons for models with evidence of a difference
+emmeans_vars = as.vector(filter(anova_df, 
+                                anova_df$`Pr(>F)` <= 0.05)$Response) 
+emmeans_vars = str_remove(emmeans_vars, ".Phase")
+emmeans_vars = str_remove(emmeans_vars, ":Group")
+
+list_of_datasets <- list("Summary Statistics" = summary, 
+                         "Mixed Model Results" = anova_df)
+write.xlsx(list_of_datasets, file = "results.xlsx")
+```
+
+## Response variables that show evidence of a treatment or treatment*time difference
+- OGA.BWD_LF
+- OGA.BWD_RH
+- CSOM.ACT_MEAN
+- CSOM.BEHAV_MEAN
+- CBPI.PSS
+- CBPI.PIS
+- CBPI.QOL
+
+```{r}
+# Pairwise comparisons
+emmeans_list = map(model_list[names(model_list) %in% emmeans_vars], 
+                   emmeans, ~Group*Phase)
+pair_list = map(emmeans_list, contrast, "pairwise")
+```
+
