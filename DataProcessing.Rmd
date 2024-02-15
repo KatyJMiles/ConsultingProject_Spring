@@ -73,6 +73,9 @@ create_boxplots = function(input) {
 
 boxplot_list = lapply(response_variables, create_boxplots)
 names(boxplot_list) = response_variables
+
+# Save all plots in pdf (one plot per page)
+all_plots = ggexport(boxplot_list, filename = "boxplots.pdf")
 ```
 
 ## Analysis
@@ -98,16 +101,13 @@ plist = as.data.frame(t(unlist(model_summary))) %>%
 
 anova_df =  as.data.frame(do.call(rbind, model_summary))  %>%
   rownames_to_column() %>%
-  rename(Response = rowname) %>%
-  filter(str_detect(Response, "Phase"))
+  rename(Response = rowname) 
 
 write.csv(anova_df, "analysis_results.csv", row.names = FALSE)
 
 # Get pairwise comparisons for models with evidence of a difference
 emmeans_vars = as.vector(filter(anova_df, 
                                 anova_df$`Pr(>F)` <= 0.05)$Response) 
-emmeans_vars = str_remove(emmeans_vars, ".Phase")
-emmeans_vars = str_remove(emmeans_vars, ":Group")
 
 list_of_datasets <- list("Summary Statistics" = summary, 
                          "Mixed Model Results" = anova_df)
