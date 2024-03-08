@@ -1,0 +1,585 @@
+---
+title: "Platinum Analysis Report"
+author:
+  - "Katy Miles" 
+  - "Dr. Ann Hess"
+date: "`r Sys.Date()`"
+header-includes: 
+  - \renewcommand{\and}{\\}
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+# Load in libraries
+library(tidyverse)
+library(readxl)
+library(lme4)
+library(emmeans)
+library(openxlsx)
+library(ggpubr)
+library(performance)
+library(stringr)
+
+# read in data
+raw_data_sh1 = read_excel("Study Stats Platinum_Final_2-2-24_KM_3-6-24.xlsx")
+
+raw_data_sh2 = read_excel("Study Stats Platinum_Final_2-2-24_KM_3-6-24.xlsx", sheet = "ACTIVITY")
+
+# Set response variables of interest
+response_variables = c("OGA.BWD_AL", "SOS", "CSOM.ACT(MEAN)", 
+                       "CSOM.BEHAV(MEAN)", "CBPI.PSS",
+                       "CBPI.PIS", "CBPI.QOL", "SED_MIN/DAY", "LIGHT_MIN/DAY",
+                        "VIG_MIN/DAY","Total Daily Activity Count")
+
+
+## Get treatment mapping
+map_treatment = function(patient) {
+  t1 = raw_data_sh2 %>%
+    filter(`Enroll #` == patient, 
+           `B1 - T1 - B2 - T2` == "T1_1")
+  t2 = raw_data_sh2 %>%
+    filter(`Enroll #` == patient, 
+           `B1 - T1 - B2 - T2` == "T2_1")
+
+  return(c(rep(t1[1,]$`Supplement Administered`, 3), 
+             rep(t2[1,]$`Supplement Administered`, 3)))
+}
+
+treatment = unlist(map(unique(raw_data_sh2$`Enroll #`), map_treatment))
+
+# Code visits in terms of baseline, post1, post2
+## Visits 2 and 5 will be coded as baseline
+## Visits 3 and 6 will be coded as post1
+## Visits 4 and 7 will be coded as post2
+## Visit 1 will be coded as intro and dropped for purposes of analysis
+
+## Just need analysis on OG_AL
+clean_data_sh1 = raw_data_sh1 %>%
+  rename(Patient = `Enroll #`) %>%
+  mutate(Time = ifelse(Visit == 2 | Visit == 5, "baseline",
+                        ifelse(Visit == 3 | Visit == 6, "post1",
+                        ifelse(Visit == 4 | Visit == 7, "post2", "intro")))) %>%
+  filter(Time != "intro") %>%   # Drop visit 1 as not used in analysis
+  select(-c(`Affected Limb (AL)`, Group, Visit, TX)) %>%
+  cbind(Treatment = treatment) %>%
+  filter(Patient != 39 & Patient != 6) %>% #Drop doges 39 and 6, not needed in the analysis
+  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+
+clean_data_sh2 = raw_data_sh2 %>%
+  rename(Time = `B1 - T1 - B2 - T2`, Patient = `Enroll #`) %>%
+  mutate(Time = factor(Time,levels = c("B1","T1_1","T1_2",
+                                         "B2", "T2_1", "T2_2"))) %>%
+  group_by(Patient, Time) %>%
+  summarise("SED_MIN/DAY" = mean(`SED_MIN/DAY`,na.rm = T),
+            "LIGHT_MIN/DAY" = mean(`LIGHT_MIN/DAY`,na.rm = T),
+            "VIG_MIN/DAY" = mean(`VIG_MIN/DAY`,na.rm = T),
+            "Total Daily Activity Count" = mean(`Total Daily Activity Count`,na.rm = T)) %>%
+  cbind(Treatment = treatment) %>%
+  filter(Patient != 39 & Patient != 6) %>%
+  mutate(Time = ifelse(Time == "B1" | Time == "B2", "baseline",
+                      ifelse(Time == "T1_1" | Time == "T2_1", "post1",
+                      ifelse(Time == "T1_2" | Time == "T2_2", "post2", "intro"))))  %>%
+  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+
+# Combine data
+clean_data = rbind(clean_data_sh1, clean_data_sh2) %>%
+              filter(Response %in% response_variables)
+
+## Analysis
+fit_model = function(input) {
+  data = clean_data %>%
+       filter(Response == input)
+  fit = lmerTest::lmer(Value ~ Time*Treatment + (1|Patient), data = data)
+  return(fit)
+}
+
+model_list = map(response_variables, fit_model)
+names(model_list) = response_variables
+
+model_summary = lapply(model_list, stats::anova, type = 3)
+names(model_summary) = response_variables
+
+# Get a list of p-values from model summary
+plist = as.data.frame(t(unlist(model_summary))) %>%
+  select(matches(".Pr"))
+
+# Find FDR adjusted p-values
+plist_adjusted = p.adjust(plist, method = "fdr")
+
+anova_df =  as.data.frame(do.call(rbind, model_summary)) %>%
+  cbind(plist_adjusted) %>%
+  rownames_to_column() %>%
+  rename(Response = rowname, "Adj Pr(>F)" = plist_adjusted, "Raw Pr(>F)" = `Pr(>F)`)
+
+
+# Get pairwise comparisons for models with evidence of a difference
+emmeans_vars = as.vector(filter(anova_df, 
+                                anova_df$`Adj Pr(>F)` <= 0.05)$Response) 
+
+emmeans_vars = emmeans_vars[stringr::str_detect(emmeans_vars, "Treatment")]
+emmeans_vars = emmeans_vars %>%
+                  str_remove(".Time:Treatment") %>%
+                  str_remove(".Treatment")
+
+emmeans_list1 = map(model_list[names(model_list) %in% emmeans_vars], 
+                   emmeans, ~Time|Treatment)
+emmeans_list2 = map(model_list[names(model_list) %in% emmeans_vars], 
+                   emmeans, ~Treatment|Time)
+
+pair_list1 = map(emmeans_list1, contrast, "pairwise")
+pair_list2 = map(emmeans_list2, contrast, "pairwise")
+
+# Create a df for contrasts
+contrast_df1 = matrix(ncol = 8)
+colnames(contrast_df1) = c("contrast", "Treatment", "estimate",
+                          "SE", "df", "t.ratio",  
+                          "p.value",  "Response")
+for (i in 1:length(pair_list1)) {
+  rows = summary(pair_list1[[i]])
+  rows = cbind(rows, Response = rep(names(pair_list1)[[i]], 3))
+  contrast_df1 = rbind(contrast_df1, rows)
+}
+contrast_df1 = contrast_df1 %>%
+  relocate("Response")
+
+# Create a df for contrasts
+contrast_df2 = matrix(ncol = 8)
+colnames(contrast_df2) = c("contrast", "Time", "estimate",
+                          "SE", "df", "t.ratio",  
+                          "p.value",  "Response")
+for (i in 1:length(pair_list2)) {
+  rows = summary(pair_list2[[i]])
+  rows = cbind(rows, Response = rep(names(pair_list2)[[i]], 3))
+  contrast_df2 = rbind(contrast_df2, rows)
+}
+contrast_df2 = contrast_df2 %>%
+  relocate("Response")
+```
+
+# Analysis
+
+Analysis was done using R software. 
+
+Analysis was performed for the following response variables: OGA.BWD_AL, SOS, CSOM.ACT(MEAN), CSOM.BEHAV(MEAN), CBPI.PSS , CBPI.PIS, CBPI.QOL, Actical (Sed, Light, Vig, Total Daily Activity Count). 
+
+Visit 1 was not used for analysis.  Prior to statistical analysis, visits 2-7 were resolved into treatment and time.  Visits 2,3,4 represent baseline, post1 and post2 for the initial treatment phase.  Visits 5,6,7 represent baseline, post1, post2 for the second treatment phase.
+
+Actical data was averaged over days to values corresponding to visits (using data column B1-T1-B2-T2).
+
+Summary statistics including mean, median, standard deviation, minimum, Q1, Q3 and maximum of each response variable by treatment and time point were calculated. Boxplots are provided for each response variable by treatment and visit.
+
+Mixed models were fit separately for each response variable. Treatment (A or B), Time (baseline, post1, post2), and an interaction between treatment and time were included as fixed effects. Patient was included as a random effect to account for variability between different individual dogs. Benjamini-Hochberg adjusted F-test p-values are provided to account for multiple response variables. 
+
+Pairwise comparisons were performed for response variables that showed evidence of a treatment or treatment/time difference. Tukey adjustments were made to account for multiple comparisons for pairwise comparisons by treatment. 
+
+Diagnostic plots were investigated to check model assumptions. For Actical Total Activity, we saw evidence of unequal variance. However, after trying a log transformation (to satisfy model assumptions), there was still no evidence of a treatment or treatment*time interaction. Hence we present the results on the original scale.  
+
+
+# Results
+
+## Full Results
+
+Boxplots.pdf shows boxplots for the response variable of interest by treatment and time point. 
+
+results.xlsx contains the following sheets:
+
+- Summary Statistics: Contains columns detailing the response variable, time, treatment, min, Q1, median, mean, Q3, max, sd, and N (sample size). 
+
+- Mixed Model Results: Contains columns detailing the response variable and output from the mixed model results. Raw Pr(>F) represents the unadjusted p-values and Adj Pr(>F) represents the Benjamini-Hochberg adjusted F-test p-values. 
+
+- Pairwise Comparisons|Treatment: Contains columns detailing output from pairwise comparisons by treatment. Only those response variables that showed evidence of a treatment or treatment*time interaction were considered for further pairwise comparisons. Tukey adjustments were made to account for multiple comparisons. 
+
+- Pairwise Comparisons|Time: Contains columns detailing output from pairwise comparisons by time. Only those response variables that showed evidence of a treatment or treatment*time interaction were considered for further pairwise comparisons.
+
+For those response variables that showed evidence of a treatment or treatment*time interaction, detailed results are also provided here as well as example interpretations. 
+
+## OGA BWD
+
+### Graph
+
+```{r}
+library(readxl)
+library(kableExtra)
+library(tidyverse)
+
+model = model_list$OGA.BWD_AL
+
+p = emmip(model, Treatment ~ Time, CI = TRUE) + 
+  theme_minimal() + 
+  ggtitle("OGA BWD") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+print(p)
+```
+**Example Interpretation**: Estimated marginal means of each treatment across time points for OGA BWD are displayed. The vertical lines represent the 95% confidence interval for the estimated marginal mean. 
+
+### ANOVA Table
+
+```{r}
+anova_df_subset = anova_df %>%
+  filter(str_detect(Response, "OGA.BWD_AL"))
+
+knitr::kable(anova_df_subset,"latex", caption = "Mixed Model Results", booktabs = T, digits = 4) 
+```
+
+### Pairwise Comparisons by Treatment
+
+```{r}
+pairwise1_results = pair_list1$OGA.BWD_AL
+
+
+knitr::kable(pairwise1_results,"latex", caption = "Pairwise Comparisons by Treatment", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+**Example Interpretation**: For OGA BWD A baseline - A post1: the estimated difference between means is -0.2718.  Because the difference is negative this indicates that A baseline had a lower mean than A post1. (This can be confirmed using the graph or summary statistics).  The corresponding Tukey-adjusted p-value is 0.7679. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Pairwise Comparisons by Time
+
+```{r}
+pairwise2_results = pair_list2$OGA.BWD_AL
+
+
+knitr::kable(pairwise2_results,"latex", caption = "Pairwise Comparisons by Time", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+
+**Example Interpretation**: For OGA BWD A baseline - B baseline: the estimated difference between means is 1.09.  Because the difference is positive this indicates that A baseline had a higher mean. (This can be confirmed using the graph or summary statistics).  The corresponding p-value is 0.006. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Discussion
+
+From the mixed model results, evidence of a difference for a treatment effect was observed. Further pairwise comparisons showed that for the baseline time point, there was evidence of a difference between the means of A and B. Time points post1 and post2 did not show evidence of a difference between the means of A and B. No evidence of a difference was found between any time points within treatments. 
+
+## SOS
+
+### Graph
+
+```{r}
+library(readxl)
+library(kableExtra)
+library(tidyverse)
+
+model = model_list$SOS
+
+p = emmip(model, Treatment ~ Time, CI = TRUE) + 
+  theme_minimal() + 
+  ggtitle("SOS") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+print(p)
+```
+
+**Example Interpretation**: Estimated marginal means of each treatment across time points for SOS are displayed. The vertical lines represent the 95% confidence interval for the estimated marginal mean. 
+
+### ANOVA Table
+
+```{r}
+anova_df_subset = anova_df %>%
+  filter(str_detect(Response, "SOS"))
+
+knitr::kable(anova_df_subset,"latex", caption = "Mixed Model Results", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+### Pairwise Comparisons by Treatment
+
+```{r}
+pairwise1_results = pair_list1$SOS
+
+
+knitr::kable(pairwise1_results,"latex", caption = "Pairwise Comparisons by Treatment", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+**Example Interpretation**: For SOS A baseline - A post1: the estimated difference between means is 0.3333.  Because the difference is positive this indicates that A baseline had a higher mean. (This can be confirmed using the graph or summary statistics).  The corresponding Tukey-adjusted p-value is 0.4348. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Pairwise Comparisons by Time
+
+```{r}
+pairwise2_results = pair_list2$SOS
+
+
+knitr::kable(pairwise2_results,"latex", caption = "Pairwise Comparisons by Time", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+**Example Interpretation**: For SOS A baseline - B baseline : the estimated difference between means is -0.3.  Because the difference is negative this indicates that A baseline had a lower mean. (This can be confirmed using the graph or summary statistics).  The corresponding p-value is 0.2737. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Discussion
+
+From the mixed model results, evidence of a difference for a treatment effect was observed. Further pairwise comparisons showed that for the post2 time point, there was evidence of a difference between the means of A and B. Time points baseline and post1 did not show evidence of a difference between the means of A and B. No evidence of a difference was found between any time points within treatments. 
+
+## Actical Vig
+
+### Graph
+
+```{r}
+library(readxl)
+library(kableExtra)
+library(tidyverse)
+
+model = model_list$`VIG_MIN/DAY`
+
+p = emmip(model, Treatment ~ Time, CI = TRUE) + 
+  theme_minimal() + 
+  ggtitle("Actical Vig") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))
+print(p)
+```
+
+**Example Interpretation**: Estimated marginal means of each treatment across time points for Actical are displayed. The vertical lines represent the 95% confidence interval for the estimated marginal mean. 
+
+### ANOVA Table
+
+```{r}
+anova_df_subset = anova_df %>%
+  filter(str_detect(Response, "VIG_MIN/DAY"))
+
+knitr::kable(anova_df_subset,"latex", caption = "Mixed Model Results", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+
+### Pairwise Comparisons by Treatment
+
+```{r}
+pairwise1_results = pair_list1$`VIG_MIN/DAY`
+
+
+knitr::kable(pairwise1_results,"latex", caption = "Pairwise Comparisons by Treatment", booktabs = T, digits = 4) %>%
+    kable_styling(latex_options = "HOLD_position") 
+```
+
+**Example Interpretation**: For Actical Vig A baseline - A post1: the estimated difference between means is 0.9476.  Because the difference is positive this indicates that A baseline had a higher mean. (This can be confirmed using the graph or summary statistics). The corresponding Tukey-adjusted p-value is 0.5258. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Pairwise Comparisons by Time
+
+```{r}
+pairwise2_results = pair_list2$`VIG_MIN/DAY`
+
+
+knitr::kable(pairwise2_results,"latex", caption = "Pairwise Comparisons by Time", booktabs = T, digits = 4) %>% kable_styling(latex_options = "HOLD_position") 
+```
+
+**Example Interpretation**: For Actical Vig A baseline - B baseline : the estimated difference between means is -0.8466.  Because the difference is negative this indicates that A baseline had a lower mean. (This can be confirmed using the graph or summary statistics).  The corresponding p-value is 0.3536. Recall that small p-values (typically less than 0.05) provide evidence of a difference.
+
+### Discussion
+
+From the mixed model results, evidence of a difference for a treatment*time effect was observed. Further pairwise comparisons showed that for the post1 time point, there was evidence of a difference between the means of A and B, with treatment B having a higher mean than treatment A. For the post2 time point, there was evidence of a difference between the means of A and B, with treatment A having a higher mean than treatment B. Time point baseline did not show evidence of a difference between the means of A and B. Evidence of a difference was found between post1 and post2 time points for treatment B.
+
+# Notes
+
+- Patients 6 and 39 only have data for visits 1 and 2 (both pre-treatment). These dogs were dropped from the analysis, but should be mentioned in the paper. 
+
+- In the Actical data, patient 32 appeared to have a few data entry typos for the B1 block. Due to the arrangement of the rest of the patients, where B1, T1_1, T1_2, etc. appeared in order, these entries were changed manually in the data sheet to be B1 instead of B2 in a few cases and B3 in one case. 
+
+- We note that patient 31 had a small SED_MIN/DAY value (37.83) during the T2_1 phase compared to the other SED_MIN/Day values. This outlier was kept in the analysis. 
+
+# Appendix
+
+```{r, echo=TRUE, eval=FALSE}
+# Load in libraries
+library(tidyverse)
+library(readxl)
+library(lme4)
+library(emmeans)
+library(openxlsx)
+library(ggpubr)
+library(performance)
+library(stringr)
+
+## Data Processing
+
+# read in data
+raw_data_sh1 = read_excel("Study Stats Platinum_Final_2-2-24_KM_3-6-24.xlsx")
+
+raw_data_sh2 = read_excel("Study Stats Platinum_Final_2-2-24_KM_3-6-24.xlsx", sheet = "ACTIVITY")
+
+# Set response variables of interest
+response_variables = c("OGA.BWD_AL", "SOS", "CSOM.ACT(MEAN)", 
+                       "CSOM.BEHAV(MEAN)", "CBPI.PSS",
+                       "CBPI.PIS", "CBPI.QOL", "SED_MIN/DAY", "LIGHT_MIN/DAY",
+                        "VIG_MIN/DAY","Total Daily Activity Count")
+
+
+## Get treatment mapping
+map_treatment = function(patient) {
+  t1 = raw_data_sh2 %>%
+    filter(`Enroll #` == patient, 
+           `B1 - T1 - B2 - T2` == "T1_1")
+  t2 = raw_data_sh2 %>%
+    filter(`Enroll #` == patient, 
+           `B1 - T1 - B2 - T2` == "T2_1")
+
+  return(c(rep(t1[1,]$`Supplement Administered`, 3), 
+             rep(t2[1,]$`Supplement Administered`, 3)))
+}
+
+treatment = unlist(map(unique(raw_data_sh2$`Enroll #`), map_treatment))
+
+# Code visits in terms of baseline, post1, post2
+## Visits 2 and 5 will be coded as baseline
+## Visits 3 and 6 will be coded as post1
+## Visits 4 and 7 will be coded as post2
+## Visit 1 will be coded as intro and dropped for purposes of analysis
+
+## Just need analysis on OG_AL
+clean_data_sh1 = raw_data_sh1 %>%
+  rename(Patient = `Enroll #`) %>%
+  mutate(Time = ifelse(Visit == 2 | Visit == 5, "baseline",
+                        ifelse(Visit == 3 | Visit == 6, "post1",
+                        ifelse(Visit == 4 | Visit == 7, "post2", "intro")))) %>%
+  filter(Time != "intro") %>%   # Drop visit 1 as not used in analysis
+  select(-c(`Affected Limb (AL)`, Group, Visit, TX)) %>%
+  cbind(Treatment = treatment) %>%
+  filter(Patient != 39 & Patient != 6) %>% #Drop doges 39 and 6, not needed in the analysis
+  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+
+clean_data_sh2 = raw_data_sh2 %>%
+  rename(Time = `B1 - T1 - B2 - T2`, Patient = `Enroll #`) %>%
+  mutate(Time = factor(Time,levels = c("B1","T1_1","T1_2",
+                                         "B2", "T2_1", "T2_2"))) %>%
+  group_by(Patient, Time) %>%
+  summarise("SED_MIN/DAY" = mean(`SED_MIN/DAY`,na.rm = T),
+            "LIGHT_MIN/DAY" = mean(`LIGHT_MIN/DAY`,na.rm = T),
+            "VIG_MIN/DAY" = mean(`VIG_MIN/DAY`,na.rm = T),
+            "Total Daily Activity Count" = mean(`Total Daily Activity Count`,na.rm = T)) %>%
+  cbind(Treatment = treatment) %>%
+  filter(Patient != 39 & Patient != 6) %>%
+  mutate(Time = ifelse(Time == "B1" | Time == "B2", "baseline",
+                      ifelse(Time == "T1_1" | Time == "T2_1", "post1",
+                      ifelse(Time == "T1_2" | Time == "T2_2", "post2", "intro"))))  %>%
+  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+
+# Combine data
+clean_data = rbind(clean_data_sh1, clean_data_sh2) %>%
+              filter(Response %in% response_variables)
+
+
+## Summary Statistics
+summary = clean_data %>%
+      group_by(Response, Time, Treatment) %>%
+        summarise(Min=min(Value, na.rm = T), 
+                  Q1=quantile(Value, probs = 0.25, na.rm = T),
+                  Median=median(Value, na.rm = T), 
+                  Mean = mean(Value, na.rm = T), 
+                  Q3=quantile(Value, probs = 0.75, na.rm = T),
+                  Max=max(Value, na.rm = T), 
+                  SD = sd(Value, na.rm = T),
+                  N = sum(!is.na(Value))) %>%
+  arrange(Response, Treatment)
+
+## Summary plots
+create_boxplots = function(input) {
+  data = clean_data %>%
+    filter(Response == input)
+  
+  p = ggplot(data, aes(x = Time, y = Value, color= Treatment)) + 
+    geom_boxplot() + 
+    ylab(input) + 
+    theme_minimal()
+  return(p)
+}
+
+boxplot_list = lapply(response_variables, create_boxplots)
+names(boxplot_list) = response_variables
+
+# Save all plots in pdf (one plot per page)
+all_plots = ggexport(boxplot_list, filename = "boxplots.pdf")
+
+## Analysis
+fit_model = function(input) {
+  data = clean_data %>%
+       filter(Response == input)
+  fit = lmerTest::lmer(Value ~ Time*Treatment + (1|Patient), data = data)
+  return(fit)
+}
+
+model_list = map(response_variables, fit_model)
+names(model_list) = response_variables
+
+model_summary = lapply(model_list, stats::anova, type = 3)
+names(model_summary) = response_variables
+
+# Get a list of p-values from model summary
+plist = as.data.frame(t(unlist(model_summary))) %>%
+  select(matches(".Pr"))
+
+# Find FDR adjusted p-values
+plist_adjusted = p.adjust(plist, method = "fdr")
+
+anova_df =  as.data.frame(do.call(rbind, model_summary)) %>%
+  cbind(plist_adjusted) %>%
+  rownames_to_column() %>%
+  rename(Response = rowname, "Adj Pr(>F)" = plist_adjusted, "Raw Pr(>F)" = `Pr(>F)`)
+
+
+# Get pairwise comparisons for models with evidence of a difference
+emmeans_vars = as.vector(filter(anova_df, 
+                                anova_df$`Adj Pr(>F)` <= 0.05)$Response) 
+
+emmeans_vars = emmeans_vars[stringr::str_detect(emmeans_vars, "Treatment")]
+emmeans_vars = emmeans_vars %>%
+                  str_remove(".Time:Treatment") %>%
+                  str_remove(".Treatment")
+
+emmeans_list1 = map(model_list[names(model_list) %in% emmeans_vars], 
+                   emmeans, ~Time|Treatment)
+emmeans_list2 = map(model_list[names(model_list) %in% emmeans_vars], 
+                   emmeans, ~Treatment|Time)
+
+pair_list1 = map(emmeans_list1, contrast, "pairwise")
+pair_list2 = map(emmeans_list2, contrast, "pairwise")
+
+# Create a df for contrasts
+contrast_df1 = matrix(ncol = 8)
+colnames(contrast_df1) = c("contrast", "Treatment", "estimate",
+                          "SE", "df", "t.ratio",  
+                          "p.value",  "Response")
+for (i in 1:length(pair_list1)) {
+  rows = summary(pair_list1[[i]])
+  rows = cbind(rows, Response = rep(names(pair_list1)[[i]], 3))
+  contrast_df1 = rbind(contrast_df1, rows)
+}
+contrast_df1 = contrast_df1 %>%
+  relocate("Response")
+
+# Create a df for contrasts
+contrast_df2 = matrix(ncol = 8)
+colnames(contrast_df2) = c("contrast", "Time", "estimate",
+                          "SE", "df", "t.ratio",  
+                          "p.value",  "Response")
+for (i in 1:length(pair_list2)) {
+  rows = summary(pair_list2[[i]])
+  rows = cbind(rows, Response = rep(names(pair_list2)[[i]], 3))
+  contrast_df2 = rbind(contrast_df2, rows)
+}
+contrast_df2 = contrast_df2 %>%
+  relocate("Response")
+
+# Create sheets for result excel file
+list_of_datasets <- list("Summary Statistics" = summary, 
+                         "Mixed Model Results" = anova_df, 
+                         "Pairwise Comparisons|Treatment" = contrast_df1[-1,],
+                         "Pairwise Comparisons|Time" = contrast_df2[-1,])
+write.xlsx(list_of_datasets, file = "results.xlsx")
+
+## Checking assumptions
+resid_plots = map(model_list, plot)
+
+# Checking log-transformed total daily activity count
+total_act_data = clean_data %>%
+  filter(Response == "Total Daily Activity Count") %>%
+  mutate(Value = log(Value))
+
+fit = lmerTest::lmer(Value ~ Time*Treatment + (1|Patient), data = total_act_data)
+anova(fit)
+plot(fit)
+```
+
+
