@@ -49,7 +49,17 @@ map_treatment = function(patient) {
              rep(t2[1,]$`Supplement Administered`, 3)))
 }
 
+## Get treatment mapping
+map_grouping = function(patient) {
+  t1 = raw_data_sh2 %>%
+    filter(`Enroll #` == patient, 
+           `B1 - T1 - B2 - T2` == "T1_1")
+  group = t1[1,]$`Supplement Administered`
+  return(rep(group, 6))
+}
+
 treatment = unlist(map(unique(raw_data_sh2$`Enroll #`), map_treatment))
+grouping = unlist(map(unique(raw_data_sh2$`Enroll #`), map_grouping))
 
 # Code visits in terms of baseline, post1, post2
 ## Visits 2 and 5 will be coded as baseline
@@ -64,10 +74,10 @@ clean_data_sh1 = raw_data_sh1 %>%
                         ifelse(Visit == 3 | Visit == 6, "post1",
                         ifelse(Visit == 4 | Visit == 7, "post2", "intro")))) %>%
   filter(Time != "intro") %>%   # Drop visit 1 as not used in analysis
-  select(-c(`Affected Limb (AL)`, Group, Visit, TX)) %>%
-  cbind(Treatment = treatment) %>%
+  select(-c(`Affected Limb (AL)`, Group, TX)) %>%
+  cbind(Treatment = treatment, Grouping = grouping) %>%
   filter(Patient != 39 & Patient != 6) %>% #Drop doges 39 and 6, not needed in the analysis
-  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+  pivot_longer(!c(Treatment, Patient, Time, Visit, Grouping), names_to = "Response", values_to = "Value")
 
 clean_data_sh2 = raw_data_sh2 %>%
   rename(Time = `B1 - T1 - B2 - T2`, Patient = `Enroll #`) %>%
@@ -78,12 +88,18 @@ clean_data_sh2 = raw_data_sh2 %>%
             "LIGHT_MIN/DAY" = mean(`LIGHT_MIN/DAY`,na.rm = T),
             "VIG_MIN/DAY" = mean(`VIG_MIN/DAY`,na.rm = T),
             "Total Daily Activity Count" = mean(`Total Daily Activity Count`,na.rm = T)) %>%
-  cbind(Treatment = treatment) %>%
+  cbind(Treatment = treatment, Grouping = grouping) %>%
   filter(Patient != 39 & Patient != 6) %>%
+  mutate(Visit = ifelse(Time == "B1", 2,
+                        ifelse(Time == "T1_1", 3,
+                        ifelse(Time == "T1_2", 4,
+                        ifelse(Time == "B2", 5,
+                        ifelse(Time == "T2_1", 6,
+                        ifelse(Time == "T2_2", 7, 8))))))) %>%
   mutate(Time = ifelse(Time == "B1" | Time == "B2", "baseline",
                       ifelse(Time == "T1_1" | Time == "T2_1", "post1",
                       ifelse(Time == "T1_2" | Time == "T2_2", "post2", "intro"))))  %>%
-  pivot_longer(!c(Treatment, Patient, Time), names_to = "Response", values_to = "Value")
+  pivot_longer(!c(Treatment, Patient, Time, Visit, Grouping), names_to = "Response", values_to = "Value")
 
 # Combine data
 clean_data = rbind(clean_data_sh1, clean_data_sh2) %>%
@@ -103,6 +119,30 @@ summary = clean_data %>%
                   SD = sd(Value, na.rm = T),
                   N = sum(!is.na(Value))) %>%
   arrange(Response, Treatment)
+
+summary2 = clean_data %>%
+      group_by(Response, Time, Treatment, Visit) %>%
+        summarise(Median=median(Value, na.rm = T), 
+                  Mean = mean(Value, na.rm = T), 
+                  SD = sd(Value, na.rm = T),
+                  N = sum(!is.na(Value)), Grouping = Grouping) %>%
+  arrange(Response, Treatment)
+
+create_plots = function(input) {
+  data = summary2 %>%
+    filter(Response == input)
+  
+  p = ggplot(data, aes(x = Visit, y = Mean, color= Treatment, group = Grouping)) + 
+    geom_line() + 
+    geom_point() + 
+    ylab(input) + 
+    theme_minimal()
+  return(p)
+}
+
+plot_list = lapply(response_variables, create_plots)
+ggexport(plot_list, filename = "visit_plots.pdf")
+
 ```
 
 ## Summary plots
